@@ -1,0 +1,181 @@
+import csv
+import json
+from pathlib import Path
+
+import pandas as pd
+
+
+COLUMNS = [
+    "scrape_timestamp",
+    "community_id",
+    "community_name",
+    "neighborhood",
+    "address_line1",
+    "state",
+    "zip",
+    "latitude",
+    "longitude",
+    "phone",
+    "email",
+    "community_description",
+    "community_amenities",
+    "community_url",
+    "unit_id",
+    "unit_name",
+    "unit_url",
+    "bed",
+    "bath",
+    "area",
+    "furnish_status",
+    "furnished_available_date",
+    "occupant_maximum",
+    "move_in_date",
+    "lease_term_months",
+    "price",
+    "total_price",
+    "furnished_price",
+    "furnished_total_price",
+    "promotion_ids",
+    "promotion_descriptions",
+]
+
+LIST_COLUMNS = {
+    "community_amenities",
+    "promotion_ids",
+    "promotion_descriptions",
+}
+
+
+class AvalonPipeline:
+    def open_spider(self, spider):
+        self.rows = []
+        self.output_dir = spider.settings.get("EXPORT_DIR")
+        self.batch_size = spider.settings.getint("BATCH_SIZE", 100)
+        self.batch_number = 0
+
+    def process_item(self, item, spider):
+        self.rows.append(dict(item))
+
+        if len(self.rows) >= self.batch_size:
+            self.flush_batch(spider)
+
+        return item
+
+    def flush_batch(self, spider):
+        if not self.rows:
+            return
+
+        batch = self.rows
+        result = self.save_rows(batch, self.output_dir)
+
+        self.batch_number += 1
+        spider.logger.info(
+            "Batch %d saved: new_rows=%d historical_rows=%d",
+            self.batch_number,
+            result["new_rows"],
+            result["historical_rows"],
+        )
+
+        self.rows = []
+
+    def close_spider(self, spider):
+        # Save the final partial batch if the total number of rows is not an
+        # exact multiple of BATCH_SIZE.
+        if self.rows:
+            self.flush_batch(spider)
+        elif self.batch_number == 0:
+            spider.logger.warning("No rows collected; nothing written")
+
+        spider.logger.info(
+            "Run %s finished: batches_saved=%d",
+            spider.run_id,
+            self.batch_number,
+        )
+
+    def clean_row(self, row):
+        return {column: row.get(column) for column in COLUMNS}
+
+    def deduplicate(self, rows):
+        # A new scrape should be kept for price history, but the same row should
+        # not be written twice during one run.
+        result = []
+        seen = set()
+
+        for row in rows:
+            row = self.clean_row(row)
+            key = tuple(
+                json.dumps(row.get(column), sort_keys=True)
+                if column in LIST_COLUMNS
+                else str(row.get(column))
+                for column in COLUMNS
+            )
+
+            if key not in seen:
+                seen.add(key)
+                result.append(row)
+
+        return result
+
+    def load_existing_json(self, path):
+        if not path.exists():
+            return []
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    def write_json(self, rows, path):
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=2, ensure_ascii=False)
+
+    def write_csv(self, rows, path):
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writeheader()
+
+            for row in rows:
+                csv_row = dict(row)
+                for column in LIST_COLUMNS:
+                    csv_row[column] = json.dumps(
+                        csv_row[column] or [], ensure_ascii=False
+                    )
+                writer.writerow(csv_row)
+
+    def write_parquet(self, rows, path):
+        # JSON-compatible strings for list columns keep the CSV and Parquet
+        # representations simple and easy to inspect.
+        parquet_rows = []
+
+        for row in rows:
+            copy = dict(row)
+            for column in LIST_COLUMNS:
+                copy[column] = json.dumps(copy[column] or [], ensure_ascii=False)
+            parquet_rows.append(copy)
+
+        frame = pd.DataFrame(parquet_rows, columns=COLUMNS)
+        frame.to_parquet(path, index=False)
+
+    def save_rows(self, rows, output_dir):
+        directory = Path(output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+
+        rows = self.deduplicate(rows)
+        json_path = directory / "avalon_units.json"
+        existing = self.load_existing_json(json_path)
+
+        # The JSON file acts as the simple historical snapshot store. A later run
+        # appends new scrape timestamps rather than replacing older observations.
+        combined = existing + rows
+        combined = self.deduplicate(combined)
+
+        self.write_json(combined, json_path)
+        self.write_csv(combined, directory / "avalon_units.csv")
+        self.write_parquet(combined, directory / "avalon_units.parquet")
+
+        return {
+            "new_rows": len(rows),
+            "historical_rows": len(combined),
+        }
