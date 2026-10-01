@@ -1,0 +1,139 @@
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import scrapy
+
+from ..parsers import (
+    PageDataError,
+    extract_community_description,
+    extract_global_content,
+    normalize_unit_records,
+    parse_community_context,
+    select_communities,
+    validate_final_row,
+)
+
+
+class AvalonSpider(scrapy.Spider):
+    name = "avalon"
+    allowed_domains = ["www.avaloncommunities.com", "avaloncommunities.com"]
+    start_urls = ["https://www.avaloncommunities.com/"]
+
+    def __init__(self, run_id=None, states=None, community_limit=None, unit_limit=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.scraped_at = datetime.now(timezone.utc).isoformat()
+        self.state_filter = (
+            {x.strip().lower() for x in states.split(",") if x.strip()}
+            if states else None
+        )
+        self.community_limit = int(community_limit) if community_limit else None
+        self.unit_limit = int(unit_limit) if unit_limit else None
+
+    def parse(self, response):
+        seen = set()
+        matched = 0
+        links = response.css("div.footer-links.locations a")
+
+        for link in links:
+            href = link.attrib.get("href")
+            if not href:
+                continue
+            url = response.urljoin(href)
+            key = url.rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+
+            slug = urlparse(url).path.strip("/").split("/")[-1].lower()
+            label = " ".join(link.css("::text").getall()).strip()
+
+            if self.state_filter:
+                label_l = label.lower().replace(" apartments", "").strip()
+                candidates = {slug, label_l, label_l.replace(" ", "-")}
+                if not (candidates & self.state_filter):
+                    self.logger.info(
+                        "Skipping state link %s (slug=%r label=%r)", url, slug, label
+                    )
+                    continue
+
+            matched += 1
+            yield response.follow(
+                url,
+                callback=self.parse_state,
+                errback=self.on_error,
+                cb_kwargs={"state_label": label},
+            )
+
+        if not links:
+            self.logger.error("No footer state links found")
+        elif self.state_filter and not matched:
+            self.logger.error("states=%s matched none of the footer links", self.state_filter)
+
+    def parse_state(self, response, state_label):
+        try:
+            data = extract_global_content(response.text)
+            communities, stats = select_communities(data)
+        except PageDataError as exc:
+            self.logger.error("State parsing failed for %s: %s", response.url, exc)
+            return
+
+        self.logger.info(
+            "%s: seen=%d selected=%d external=%d unapproved=%d",
+            state_label, stats["seen"], stats["selected"],
+            stats["skipped_external"], stats["skipped_unapproved_brand"],
+        )
+
+        if self.community_limit:
+            communities = communities[:self.community_limit]
+
+        for community in communities:
+            yield response.follow(
+                community["url"],
+                callback=self.parse_community,
+                errback=self.on_error,
+                cb_kwargs={"state_label": state_label},
+            )
+
+    def parse_community(self, response, state_label):
+        try:
+            data = extract_global_content(response.text)
+            context = parse_community_context(
+                data, extract_community_description(response.text), response.url
+            )
+        except PageDataError as exc:
+            self.logger.error("Community parsing failed for %s: %s", response.url, exc)
+            return
+
+        unit_refs = context["unit_refs"]
+        if self.unit_limit:
+            unit_refs = unit_refs[:self.unit_limit]
+
+        self.logger.info("%s: %d units", context["community_name"], len(unit_refs))
+
+        for unit_ref in unit_refs:
+            yield response.follow(
+                unit_ref["url"],
+                callback=self.parse_unit,
+                errback=self.on_error,
+                cb_kwargs={"community_context": context},
+            )
+
+    def parse_unit(self, response, community_context):
+        try:
+            data = extract_global_content(response.text)
+            rows = normalize_unit_records(data, community_context, self.scraped_at)
+        except PageDataError as exc:
+            self.logger.error("Unit parsing failed for %s: %s", response.url, exc)
+            return
+
+        for row in rows:
+            row["unit_url"] = response.url
+            errors = validate_final_row(row)
+            if errors:
+                self.logger.error("Invalid row for %s: %s", response.url, errors)
+                continue
+            yield row
+
+    def on_error(self, failure):
+        self.logger.error("Request failed: %s -> %r", failure.request.url, failure.value)
