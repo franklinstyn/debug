@@ -1,0 +1,449 @@
+import csv
+import json
+from pathlib import Path
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from scrapy.exporters import JsonItemExporter, CsvItemExporter
+
+from sqlalchemy import create_engine, MetaData, Table, Column
+from sqlalchemy import String, Integer, Float, Text
+
+
+COLUMNS = [
+    "scrape_timestamp", "community_id", "community_name",
+    "neighborhood", "address_line1", "state", "zip",
+    "latitude", "longitude", "phone", "email",
+    "community_description", "community_amenities",
+    "community_url", "unit_id", "unit_name", "unit_url",
+    "bed", "bath", "area", "furnish_status",
+    "furnished_available_date", "occupant_maximum",
+    "move_in_date", "lease_term_months", "price",
+    "total_price", "furnished_price", "furnished_total_price",
+    "promotion_ids", "promotion_descriptions"
+]
+
+
+LIST_COLUMNS = {
+    "community_amenities",
+    "promotion_ids",
+    "promotion_descriptions"
+}
+
+
+def clean_item(item):
+    row = {}
+    for column in COLUMNS:
+        value = item.get(column)
+        if column in LIST_COLUMNS and value is None:
+            value = []
+        row[column] = value
+    return row
+
+
+def prepare_mysql_row(item):
+    row = clean_item(item)
+    for column in LIST_COLUMNS:
+        if isinstance(row[column], list):
+            row[column] = json.dumps(row[column], ensure_ascii=False)
+    return row
+
+
+def read_input_file(path):
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError("Input file does not exist: %s" % path)
+
+    if path.suffix.lower() == ".json":
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if not isinstance(data, list):
+            raise ValueError("JSON file must contain a list of rows")
+
+        return data
+
+    if path.suffix.lower() == ".csv":
+        with path.open("r", newline="", encoding="utf-8") as file:
+            return list(csv.DictReader(file))
+
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path).to_dict(orient="records")
+
+    raise ValueError("Unsupported input file: %s" % path)
+
+
+class JsonPipeline:
+
+    def open_spider(self, spider):
+        output_dir = Path(spider.settings.get("EXPORT_DIR"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.file = open(output_dir / "avalon_units.json", "wb")
+        self.exporter = JsonItemExporter(
+            self.file,
+            encoding="utf-8",
+            ensure_ascii=False,
+            indent=2
+        )
+        self.exporter.start_exporting()
+
+    def process_item(self, item, spider):
+        self.exporter.export_item(clean_item(item))
+        return item
+
+    def close_spider(self, spider):
+        self.exporter.finish_exporting()
+        self.file.close()
+
+
+class CsvPipeline:
+
+    def open_spider(self, spider):
+        output_dir = Path(spider.settings.get("EXPORT_DIR"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.file = open(
+            output_dir / "avalon_units.csv",
+            "w",
+            newline="",
+            encoding="utf-8"
+        )
+
+        self.exporter = CsvItemExporter(
+            self.file,
+            fields_to_export=COLUMNS,
+            encoding="utf-8"
+        )
+        self.exporter.start_exporting()
+
+    def process_item(self, item, spider):
+        row = clean_item(item)
+
+        for column in LIST_COLUMNS:
+            row[column] = json.dumps(row[column] or [], ensure_ascii=False)
+
+        self.exporter.export_item(row)
+        return item
+
+    def close_spider(self, spider):
+        self.exporter.finish_exporting()
+        self.file.close()
+
+
+class ParquetPipeline:
+
+    def open_spider(self, spider):
+        output_dir = Path(spider.settings.get("EXPORT_DIR"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        self.path = output_dir / "avalon_units.parquet"
+        self.writer = None
+
+    def get_schema(self):
+        fields = []
+
+        for column in COLUMNS:
+            fields.append(pa.field(column, pa.string()))
+
+        return pa.schema(fields)
+
+    def process_item(self, item, spider):
+        row = clean_item(item)
+
+        for column in LIST_COLUMNS:
+            row[column] = json.dumps(row[column] or [], ensure_ascii=False)
+
+        table = pa.Table.from_pylist([row], schema=self.get_schema())
+
+        if self.writer is None:
+            self.writer = pq.ParquetWriter(self.path, table.schema)
+
+        self.writer.write_table(table)
+        return item
+
+    def close_spider(self, spider):
+        if self.writer is not None:
+            self.writer.close()
+
+
+class MySQLFlatPipeline:
+
+    def open_spider(self, spider):
+        connection_string = spider.settings.get("MYSQL_CONNECTION")
+        self.engine = create_engine(connection_string)
+        metadata = MetaData()
+
+        self.table = Table(
+            "avalon_units",
+            metadata,
+            Column("scrape_timestamp", String(100)),
+            Column("community_id", String(100)),
+            Column("community_name", String(255)),
+            Column("neighborhood", String(255)),
+            Column("address_line1", String(500)),
+            Column("state", String(100)),
+            Column("zip", String(50)),
+            Column("latitude", Float),
+            Column("longitude", Float),
+            Column("phone", String(100)),
+            Column("email", String(255)),
+            Column("community_description", Text),
+            Column("community_amenities", Text),
+            Column("community_url", Text),
+            Column("unit_id", String(100)),
+            Column("unit_name", String(255)),
+            Column("unit_url", Text),
+            Column("bed", Integer),
+            Column("bath", Float),
+            Column("area", Float),
+            Column("furnish_status", String(100)),
+            Column("furnished_available_date", String(100)),
+            Column("occupant_maximum", Integer),
+            Column("move_in_date", String(100)),
+            Column("lease_term_months", Integer),
+            Column("price", Float),
+            Column("total_price", Float),
+            Column("furnished_price", Float),
+            Column("furnished_total_price", Float),
+            Column("promotion_ids", Text),
+            Column("promotion_descriptions", Text)
+        )
+
+        metadata.create_all(self.engine)
+
+    def process_item(self, item, spider):
+        row = prepare_mysql_row(item)
+
+        with self.engine.begin() as connection:
+            connection.execute(self.table.insert(), row)
+
+        return item
+
+    def close_spider(self, spider):
+        self.engine.dispose()
+
+
+class MySQLRelationalPipeline:
+
+    def open_spider(self, spider):
+        connection_string = spider.settings.get("MYSQL_CONNECTION")
+        self.engine = create_engine(connection_string)
+        self.metadata = MetaData()
+
+        self.communities = Table(
+            "communities",
+            self.metadata,
+            Column("community_id", String(100), primary_key=True),
+            Column("name", String(255)),
+            Column("neighborhood", String(255)),
+            Column("address_line1", String(500)),
+            Column("state", String(100)),
+            Column("zip", String(50)),
+            Column("latitude", Float),
+            Column("longitude", Float),
+            Column("phone", String(100)),
+            Column("email", String(255)),
+            Column("description", Text),
+            Column("community_url", Text)
+        )
+
+        self.units = Table(
+            "units",
+            self.metadata,
+            Column("unit_id", String(100), primary_key=True),
+            Column("community_id", String(100)),
+            Column("unit_name", String(255)),
+            Column("unit_url", Text),
+            Column("bed", Integer),
+            Column("bath", Float),
+            Column("area", Float),
+            Column("furnish_status", String(100)),
+            Column("furnished_available_date", String(100)),
+            Column("occupant_maximum", Integer)
+        )
+
+        self.unit_pricing = Table(
+            "unit_pricing",
+            self.metadata,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("scrape_timestamp", String(100)),
+            Column("community_id", String(100)),
+            Column("unit_id", String(100)),
+            Column("move_in_date", String(100)),
+            Column("lease_term_months", Integer),
+            Column("price", Float),
+            Column("total_price", Float),
+            Column("furnished_price", Float),
+            Column("furnished_total_price", Float)
+        )
+
+        self.metadata.create_all(self.engine)
+
+    def process_item(self, item, spider):
+        row = clean_item(item)
+
+        community_row = {
+            "community_id": row["community_id"],
+            "name": row["community_name"],
+            "neighborhood": row["neighborhood"],
+            "address_line1": row["address_line1"],
+            "state": row["state"],
+            "zip": row["zip"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "phone": row["phone"],
+            "email": row["email"],
+            "description": row["community_description"],
+            "community_url": row["community_url"]
+        }
+
+        unit_row = {
+            "unit_id": row["unit_id"],
+            "community_id": row["community_id"],
+            "unit_name": row["unit_name"],
+            "unit_url": row["unit_url"],
+            "bed": row["bed"],
+            "bath": row["bath"],
+            "area": row["area"],
+            "furnish_status": row["furnish_status"],
+            "furnished_available_date": row["furnished_available_date"],
+            "occupant_maximum": row["occupant_maximum"]
+        }
+
+        pricing_row = {
+            "scrape_timestamp": row["scrape_timestamp"],
+            "community_id": row["community_id"],
+            "unit_id": row["unit_id"],
+            "move_in_date": row["move_in_date"],
+            "lease_term_months": row["lease_term_months"],
+            "price": row["price"],
+            "total_price": row["total_price"],
+            "furnished_price": row["furnished_price"],
+            "furnished_total_price": row["furnished_total_price"]
+        }
+
+        with self.engine.begin() as connection:
+            connection.execute(
+                self.communities.insert().prefix_with("IGNORE"),
+                community_row
+            )
+            connection.execute(
+                self.units.insert().prefix_with("IGNORE"),
+                unit_row
+            )
+            connection.execute(
+                self.unit_pricing.insert(),
+                pricing_row
+            )
+
+        return item
+
+    def close_spider(self, spider):
+        self.engine.dispose()
+
+
+class FileToMySQLPipeline:
+
+    def open_spider(self, spider):
+        connection_string = spider.settings.get("MYSQL_CONNECTION")
+        self.engine = create_engine(connection_string)
+        self.input_file = spider.settings.get("MYSQL_INPUT_FILE")
+        self.table_name = spider.settings.get(
+            "MYSQL_FILE_TABLE",
+            "avalon_units_from_file"
+        )
+
+    def process_item(self, item, spider):
+        return item
+
+    def close_spider(self, spider):
+        if not self.input_file:
+            spider.logger.warning("MYSQL_INPUT_FILE is not configured")
+            self.engine.dispose()
+            return
+
+        try:
+            rows = read_input_file(self.input_file)
+
+            if not rows:
+                spider.logger.warning("Input file contains no rows")
+                self.engine.dispose()
+                return
+
+            metadata = MetaData()
+
+            table = Table(
+                self.table_name,
+                metadata,
+                Column("id", Integer, primary_key=True, autoincrement=True),
+                Column("scrape_timestamp", String(100)),
+                Column("community_id", String(100)),
+                Column("community_name", String(255)),
+                Column("neighborhood", String(255)),
+                Column("address_line1", String(500)),
+                Column("state", String(100)),
+                Column("zip", String(50)),
+                Column("latitude", Float),
+                Column("longitude", Float),
+                Column("phone", String(100)),
+                Column("email", String(255)),
+                Column("community_description", Text),
+                Column("community_amenities", Text),
+                Column("community_url", Text),
+                Column("unit_id", String(100)),
+                Column("unit_name", String(255)),
+                Column("unit_url", Text),
+                Column("bed", Integer),
+                Column("bath", Float),
+                Column("area", Float),
+                Column("furnish_status", String(100)),
+                Column("furnished_available_date", String(100)),
+                Column("occupant_maximum", Integer),
+                Column("move_in_date", String(100)),
+                Column("lease_term_months", Integer),
+                Column("price", Float),
+                Column("total_price", Float),
+                Column("furnished_price", Float),
+                Column("furnished_total_price", Float),
+                Column("promotion_ids", Text),
+                Column("promotion_descriptions", Text)
+            )
+
+            metadata.create_all(self.engine)
+
+            clean_rows = []
+
+            for row in rows:
+                clean_row_data = {}
+
+                for column in COLUMNS:
+                    value = row.get(column)
+
+                    if column in LIST_COLUMNS:
+                        if isinstance(value, list):
+                            value = json.dumps(value, ensure_ascii=False)
+                        elif value is None:
+                            value = "[]"
+
+                    clean_row_data[column] = value
+
+                clean_rows.append(clean_row_data)
+
+            with self.engine.begin() as connection:
+                connection.execute(table.insert(), clean_rows)
+
+            spider.logger.info(
+                "Loaded %d rows from %s into MySQL",
+                len(clean_rows),
+                self.input_file
+            )
+
+        except Exception as exc:
+            spider.logger.error("File to MySQL failed: %s", exc)
+
+        finally:
+            self.engine.dispose()
