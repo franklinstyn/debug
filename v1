@@ -1,0 +1,491 @@
+import csv
+import json
+from datetime import datetime
+
+import pandas as pd
+
+from sqlalchemy import create_engine, MetaData, Table, Column, ForeignKey
+from sqlalchemy import String, Integer, Text, Numeric, select, tuple_
+from sqlalchemy.dialects.mysql import insert as mysql_insert, DATETIME, DOUBLE
+
+
+INTEGER_COLUMNS = {
+    "bed",
+    "occupant_maximum",
+    "lease_term_months"
+}
+
+FLOAT_COLUMNS = {
+    "latitude",
+    "longitude",
+    "bath",
+    "area"
+}
+
+PRICE_COLUMNS = [
+    "price",
+    "total_price",
+    "furnished_price",
+    "furnished_total_price"
+]
+
+BATCH_SIZE = 1000
+
+
+def prepare_mysql_row(item):
+    row = clean_item(item)
+
+    for column in COLUMNS:
+        value = row[column]
+
+        if column in LIST_COLUMNS:
+            row[column] = json.dumps(value or [], ensure_ascii=False)
+
+        elif value is not None:
+            if column in INTEGER_COLUMNS:
+                row[column] = int(float(value))
+            elif column in FLOAT_COLUMNS:
+                row[column] = float(value)
+
+    return row
+
+def read_input_file(path):
+    path = Path(path)
+
+    if path.suffix.lower() == ".json":
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    if path.suffix.lower() == ".csv":
+        with open(path, "r", newline="", encoding="utf-8") as file:
+            return list(csv.DictReader(file))
+
+    if path.suffix.lower() == ".parquet":
+        return pd.read_parquet(path).to_dict(orient="records")
+
+    raise ValueError(
+        "Unsupported file format: " + path.suffix
+    )
+              
+def upsert(connection, table, rows):
+    statement = mysql_insert(table)
+
+    updates = {}
+
+    for column in table.columns:
+        if not column.primary_key:
+            updates[column.name] = statement.inserted[column.name]
+
+    statement = statement.on_duplicate_key_update(updates)
+
+    connection.execute(statement, rows)
+
+
+class MySQLFlatPipeline:
+
+    def open_spider(self, spider):
+        connection_string = spider.settings.get("MYSQL_CONNECTION")
+
+        if not connection_string:
+            raise ValueError("MYSQL_CONNECTION is not configured")
+
+        self.engine = create_engine(connection_string)
+        self.rows = []
+
+        metadata = MetaData()
+
+        self.table = Table(
+            "avalon_units",
+            metadata,
+            Column("scrape_timestamp", String(100)),
+            Column("community_id", String(100)),
+            Column("community_name", String(255)),
+            Column("neighborhood", String(255)),
+            Column("address_line1", String(500)),
+            Column("state", String(100)),
+            Column("zip", String(50)),
+            Column("latitude", DOUBLE),
+            Column("longitude", DOUBLE),
+            Column("phone", String(100)),
+            Column("email", String(255)),
+            Column("community_description", Text),
+            Column("community_amenities", Text),
+            Column("community_url", Text),
+            Column("unit_id", String(100)),
+            Column("unit_name", String(255)),
+            Column("unit_url", Text),
+            Column("bed", Integer),
+            Column("bath", DOUBLE),
+            Column("area", DOUBLE),
+            Column("furnish_status", String(100)),
+            Column("furnished_available_date", String(100)),
+            Column("occupant_maximum", Integer),
+            Column("move_in_date", String(100)),
+            Column("lease_term_months", Integer),
+            Column("price", Numeric(10, 2)),
+            Column("total_price", Numeric(10, 2)),
+            Column("furnished_price", Numeric(10, 2)),
+            Column("furnished_total_price", Numeric(10, 2)),
+            Column("promotion_ids", Text),
+            Column("promotion_descriptions", Text)
+        )
+
+        metadata.create_all(self.engine)
+
+    def process_item(self, item, spider):
+        self.rows.append(prepare_mysql_row(item))
+
+        if len(self.rows) >= BATCH_SIZE:
+            self.write_batch()
+
+        return item
+
+    def write_batch(self):
+        if not self.rows:
+            return
+
+        with self.engine.begin() as connection:
+            connection.execute(
+                self.table.insert(),
+                self.rows
+            )
+
+        self.rows = []
+
+    def close_spider(self, spider):
+        try:
+            self.write_batch()
+        finally:
+            self.engine.dispose()
+
+
+class MySQLRelationalPipeline:
+
+    def open_spider(self, spider):
+        connection_string = spider.settings.get("MYSQL_CONNECTION")
+
+        if not connection_string:
+            raise ValueError("MYSQL_CONNECTION is not configured")
+
+        self.engine = create_engine(connection_string)
+
+        self.community_rows = {}
+        self.unit_rows = {}
+        self.pricing_rows = {}
+
+        self.metadata = MetaData()
+
+        self.communities = Table(
+            "communities",
+            self.metadata,
+            Column("community_id", String(100), primary_key=True),
+            Column("community_name", String(255)),
+            Column("neighborhood", String(255)),
+            Column("address_line1", String(500)),
+            Column("state", String(100)),
+            Column("zip", String(50)),
+            Column("latitude", DOUBLE),
+            Column("longitude", DOUBLE),
+            Column("phone", String(100)),
+            Column("email", String(255)),
+            Column("community_description", Text),
+            Column("community_amenities", Text),
+            Column("community_url", Text)
+        )
+
+        self.units = Table(
+            "units",
+            self.metadata,
+            Column("unit_id", String(100), primary_key=True),
+            Column(
+                "community_id",
+                String(100),
+                ForeignKey("communities.community_id"),
+                nullable=False
+            ),
+            Column("unit_name", String(255)),
+            Column("unit_url", Text),
+            Column("bed", Integer),
+            Column("bath", DOUBLE),
+            Column("area", DOUBLE),
+            Column("furnish_status", String(100)),
+            Column("furnished_available_date", String(100)),
+            Column("occupant_maximum", Integer),
+            Column("promotion_ids", Text),
+            Column("promotion_descriptions", Text)
+        )
+
+        self.unit_pricing = Table(
+            "unit_pricing",
+            self.metadata,
+            Column(
+                "unit_id",
+                String(100),
+                ForeignKey("units.unit_id"),
+                primary_key=True
+            ),
+            Column("move_in_date", String(100), primary_key=True),
+            Column(
+                "lease_term_months",
+                Integer,
+                primary_key=True,
+                autoincrement=False
+            ),
+            Column("scrape_timestamp", String(100)),
+            Column("price", Numeric(10, 2)),
+            Column("total_price", Numeric(10, 2)),
+            Column("furnished_price", Numeric(10, 2)),
+            Column("furnished_total_price", Numeric(10, 2))
+        )
+
+        self.pricing_history = Table(
+            "unit_pricing_history",
+            self.metadata,
+            Column(
+                "unit_id",
+                String(100),
+                ForeignKey("units.unit_id"),
+                primary_key=True
+            ),
+            Column("move_in_date", String(100), primary_key=True),
+            Column(
+                "lease_term_months",
+                Integer,
+                primary_key=True,
+                autoincrement=False
+            ),
+            Column("archived_at", DATETIME(fsp=6), primary_key=True),
+            Column("scrape_timestamp", String(100)),
+            Column("price", Numeric(10, 2)),
+            Column("total_price", Numeric(10, 2)),
+            Column("furnished_price", Numeric(10, 2)),
+            Column("furnished_total_price", Numeric(10, 2))
+        )
+
+        self.metadata.create_all(self.engine)
+
+    def process_item(self, item, spider):
+        row = prepare_mysql_row(item)
+
+        community_id = row["community_id"]
+        unit_id = row["unit_id"]
+        move_in_date = row["move_in_date"]
+        lease_term = row["lease_term_months"]
+
+        community_row = {
+            "community_id": community_id,
+            "community_name": row["community_name"],
+            "neighborhood": row["neighborhood"],
+            "address_line1": row["address_line1"],
+            "state": row["state"],
+            "zip": row["zip"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "phone": row["phone"],
+            "email": row["email"],
+            "community_description": row["community_description"],
+            "community_amenities": row["community_amenities"],
+            "community_url": row["community_url"]
+        }
+
+        unit_row = {
+            "unit_id": unit_id,
+            "community_id": community_id,
+            "unit_name": row["unit_name"],
+            "unit_url": row["unit_url"],
+            "bed": row["bed"],
+            "bath": row["bath"],
+            "area": row["area"],
+            "furnish_status": row["furnish_status"],
+            "furnished_available_date": row["furnished_available_date"],
+            "occupant_maximum": row["occupant_maximum"],
+            "promotion_ids": row["promotion_ids"],
+            "promotion_descriptions": row["promotion_descriptions"]
+        }
+
+        pricing_row = {
+            "unit_id": unit_id,
+            "move_in_date": move_in_date,
+            "lease_term_months": lease_term,
+            "scrape_timestamp": row["scrape_timestamp"],
+            "price": row["price"],
+            "total_price": row["total_price"],
+            "furnished_price": row["furnished_price"],
+            "furnished_total_price": row["furnished_total_price"]
+        }
+
+        self.community_rows[community_id] = community_row
+        self.unit_rows[unit_id] = unit_row
+        self.pricing_rows[
+            (unit_id, move_in_date, lease_term)
+        ] = pricing_row
+
+        if len(self.pricing_rows) >= BATCH_SIZE:
+            self.write_batch()
+
+        return item
+
+    def write_batch(self):
+        if not self.pricing_rows:
+            return
+
+        pricing = self.unit_pricing.c
+
+        with self.engine.begin() as connection:
+
+            upsert(
+                connection,
+                self.communities,
+                list(self.community_rows.values())
+            )
+
+            upsert(
+                connection,
+                self.units,
+                list(self.unit_rows.values())
+            )
+
+            existing_rows = connection.execute(
+                select(self.unit_pricing).where(
+                    tuple_(
+                        pricing.unit_id,
+                        pricing.move_in_date,
+                        pricing.lease_term_months
+                    ).in_(list(self.pricing_rows.keys()))
+                )
+            ).mappings().all()
+
+            archived_at = datetime.utcnow()
+            history_rows = []
+
+            for old_row in existing_rows:
+                key = (
+                    old_row["unit_id"],
+                    old_row["move_in_date"],
+                    old_row["lease_term_months"]
+                )
+
+                new_row = self.pricing_rows[key]
+
+                for column in PRICE_COLUMNS:
+                    if old_row[column] != new_row[column]:
+                        history_row = dict(old_row)
+                        history_row["archived_at"] = archived_at
+                        history_rows.append(history_row)
+                        break
+
+            if history_rows:
+                connection.execute(
+                    self.pricing_history.insert(),
+                    history_rows
+                )
+
+            upsert(
+                connection,
+                self.unit_pricing,
+                list(self.pricing_rows.values())
+            )
+
+        self.community_rows = {}
+        self.unit_rows = {}
+        self.pricing_rows = {}
+
+    def close_spider(self, spider):
+        try:
+            self.write_batch()
+        finally:
+            self.engine.dispose()
+
+
+class FileToMySQLPipeline:
+
+    def open_spider(self, spider):
+        self.engine = create_engine(spider.settings.get("MYSQL_CONNECTION"))
+        self.output_dir = Path(spider.settings.get("EXPORT_DIR"))
+        self.file_format = spider.settings.get("MYSQL_FILE_FORMAT", "csv")
+        self.table_name = spider.settings.get(
+            "MYSQL_FILE_TABLE",
+            "avalon_units_from_file"
+        )
+
+    def process_item(self, item, spider):
+        return item
+
+    def close_spider(self, spider):
+        file_name = "avalon_units." + self.file_format
+        input_file = self.output_dir / file_name
+
+        if not input_file.exists():
+            spider.logger.warning(
+                "File not found: %s",
+                input_file
+            )
+            self.engine.dispose()
+            return
+
+        spider.logger.info(
+            "Loading file into MySQL: %s",
+            input_file
+        )
+
+        rows = read_input_file(input_file)
+
+        metadata = MetaData()
+
+        table = Table(
+            self.table_name,
+            metadata,
+            Column("scrape_timestamp", DATETIME),
+            Column("community_id", String(100)),
+            Column("community_name", String(255)),
+            Column("neighborhood", String(255)),
+            Column("address_line1", String(255)),
+            Column("state", String(100)),
+            Column("zip", String(50)),
+            Column("latitude", DOUBLE),
+            Column("longitude", DOUBLE),
+            Column("phone", String(100)),
+            Column("email", String(255)),
+            Column("community_description", Text),
+            Column("community_amenities", Text),
+            Column("community_url", Text),
+            Column("community_promotion_ids", Text),
+            Column("community_promotion_descriptions", Text),
+            Column("unit_id", String(100)),
+            Column("unit_name", String(255)),
+            Column("unit_url", Text),
+            Column("bed", Integer),
+            Column("bath", DOUBLE),
+            Column("area", DOUBLE),
+            Column("furnish_status", String(100)),
+            Column("furnished_available_date", String(100)),
+            Column("occupant_maximum", Integer),
+            Column("move_in_date", DATETIME),
+            Column("lease_term_months", Integer),
+            Column("price", Numeric(12, 2)),
+            Column("total_price", Numeric(12, 2)),
+            Column("furnished_price", Numeric(12, 2)),
+            Column("furnished_total_price", Numeric(12, 2)),
+            Column("promotion_ids", Text),
+            Column("promotion_descriptions", Text)
+        )
+
+        metadata.create_all(self.engine)
+
+        rows = [
+            prepare_mysql_row(row)
+            for row in rows
+        ]
+
+        with self.engine.begin() as connection:
+            for start in range(0, len(rows), BATCH_SIZE):
+                batch = rows[start:start + BATCH_SIZE]
+                connection.execute(table.insert(), batch)
+
+        spider.logger.info(
+            "Loaded %s rows into %s",
+            len(rows),
+            self.table_name
+        )
+
+        self.engine.dispose()
